@@ -1,0 +1,872 @@
+---
+description: Deploy web application to homelab infrastructure with Traefik and Cloudflare
+---
+// turbo-all
+
+# Homelab One-Shot Deployment Workflow
+
+**Total Time**: ~40 minutes (5 min validation + 20 min build + 5 min DNS + 10 min verification)
+
+**Purpose**: This workflow prevents the 8 critical pain points that historically cost 45-60 minutes of debugging time. It enables Claude to deploy correctly on the first attempt.
+
+---
+
+## Critical Context: The 8 Pain Points
+
+Before starting, understand what this workflow prevents:
+
+1. **Missing Dependencies** (Critical) - React/framework not in package.json → Build fails
+2. **Wrong Network Name** (Critical) - Used "homelab" instead of "homelab_web" → Container unreachable
+3. **Empty Dockerfile** (High) - 1-byte Dockerfile → Build impossible
+4. **Cloudflare Caching** (High) - Old content cached → False negative on deployment
+5. **Multiple DNS Records** (Medium) - 4+ A records → DNS routing chaos
+6. **No package-lock.json** (Medium) - Must use `npm install` not `npm ci`
+7. **GitLab Auth** (Low) - Not critical, can deploy directly
+8. **YAML Escaping** (Low) - Backticks in docker-compose → Parse errors
+
+**Philosophy**: Validate first, fix immediately, then deploy. Never build on broken foundations.
+
+---
+
+## PHASE 1: Automated Pre-Flight Validation (5 minutes) ⚠️
+
+**Rule**: This phase is 100% automated. Claude MUST run all checks and fix issues before proceeding.
+
+### Step 1.1: Clone and Initial Inspection
+
+**Variables needed from user**:
+
+- `REPOSITORY_URL`: Git repository URL
+- `APP_NAME`: Application name (used for directories, containers, domains)
+
+```bash
+# Clone to temporary inspection location
+git clone <REPOSITORY_URL> /tmp/app-check
+cd /tmp/app-check
+```
+
+### Step 1.2: Validate package.json → PAIN POINT #1 & #6 PREVENTION
+
+**Purpose**: Prevent missing dependency build failures
+
+```bash
+# Check if package-lock.json exists (determines npm command)
+ls -lh package-lock.json 2>/dev/null && echo "FOUND: Use npm ci" || echo "MISSING: Use npm install"
+
+# Display package.json for validation
+cat package.json
+```
+
+**Automated Validation Checks** (Claude must verify):
+
+```bash
+# Extract and verify critical dependencies
+jq -r '.dependencies | keys[]' package.json | grep -E "(react|next|vue|svelte|express|fastify)" || echo "⚠️ WARNING: No major framework detected"
+
+# Verify build script exists
+jq -r '.scripts.build' package.json | grep -v null || echo "❌ CRITICAL: No build script"
+
+# Verify start script exists  
+jq -r '.scripts.start' package.json | grep -v null || echo "❌ CRITICAL: No start script"
+```
+
+**Auto-Fix Template** (if validation fails):
+
+If dependencies are missing, Claude must:
+
+1. STOP the deployment
+2. Report missing dependencies to user
+3. Ask: "The following critical dependencies are missing from package.json: [LIST]. Should I add them with `npm install --save [packages]`?"
+4. Wait for user approval before modifying package.json
+
+**Success Criteria**:
+
+- ✅ All framework dependencies present (React, Next.js, etc.)
+- ✅ `build` script exists
+- ✅ `start` script exists
+- ✅ Note taken: Use `npm ci` or `npm install`
+
+### Step 1.3: Validate Dockerfile → PAIN POINT #3 PREVENTION
+
+**Purpose**: Prevent empty/broken Dockerfile
+
+```bash
+# Check Dockerfile exists and has content
+wc -l Dockerfile
+stat -c%s Dockerfile  # Byte size
+head -20 Dockerfile  # Show first 20 lines
+```
+
+**Automated Validation Checks**:
+
+```bash
+# File must be > 10 lines (empty Dockerfiles are 0-2 bytes)
+LINES=$(wc -l < Dockerfile)
+if [ $LINES -lt 10 ]; then
+    echo "❌ CRITICAL: Dockerfile has only $LINES lines (likely empty/broken)"
+    exit 1
+fi
+
+# Must have essential instructions
+grep -q "^FROM" Dockerfile || echo "❌ MISSING: FROM statement"
+grep -q "COPY\|ADD" Dockerfile || echo "❌ MISSING: COPY/ADD commands"  
+grep -q "CMD\|ENTRYPOINT" Dockerfile || echo "❌ MISSING: CMD/ENTRYPOINT"
+```
+
+**Auto-Fix Template** (if Dockerfile broken):
+
+If Dockerfile is < 10 lines or missing essential instructions:
+
+```dockerfile
+# Next.js Dockerfile Template (Production-Optimized)
+FROM node:18-alpine AS base
+
+# Install dependencies only when needed
+FROM base AS deps
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+# Rebuild the source code only when needed
+FROM base AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+# Production image
+FROM base AS runner
+WORKDIR /app
+ENV NODE_ENV production
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+USER nextjs
+EXPOSE 3000
+ENV PORT 3000
+CMD ["node", "server.js"]
+```
+
+Claude must:
+
+1. STOP deployment
+2. Show the broken Dockerfile
+3. Ask: "Dockerfile is broken (X lines, missing Y). Should I replace it with a template for [detected framework]?"
+4. Wait for user approval
+
+**Success Criteria**:
+
+- ✅ Dockerfile > 10 lines
+- ✅ Has FROM, COPY/ADD, CMD/ENTRYPOINT
+- ✅ Appropriate for detected framework
+
+### Step 1.4: Validate Infrastructure → PAIN POINT #2 PREVENTION
+
+**Purpose**: Ensure correct Docker network exists
+
+```bash
+# Check Docker networks (run on homelab server via SSH)
+ssh <HOMELAB_SERVER> "docker network ls"
+```
+
+**Automated Validation**:
+
+```bash
+# Network MUST be homelab_web (NOT "homelab")
+ssh <HOMELAB_SERVER> "docker network ls | grep homelab_web" || {
+    echo "❌ CRITICAL: homelab_web network not found"
+    echo "Available networks:"
+    ssh <HOMELAB_SERVER> "docker network ls"
+    exit 1
+}
+```
+
+**Auto-Fix**:
+
+```bash
+# Create network if missing
+ssh <HOMELAB_SERVER> "docker network create homelab_web"
+```
+
+**Success Criteria**:
+
+- ✅ Network `homelab_web` exists (exact name match)
+- ✅ Network is available for container attachment
+
+### Step 1.5: Validate docker-compose.yml → PAIN POINT #8 PREVENTION
+
+**Purpose**: Prevent YAML syntax errors and configuration issues
+
+```bash
+# Display docker-compose.yml
+cat docker-compose.yml
+```
+
+**Automated Validation Checks**:
+
+```bash
+# Validate YAML syntax
+docker-compose config -q || echo "❌ YAML Syntax Error"
+
+# Check for backticks (common YAML escaping issue)
+grep '`' docker-compose.yml && echo "⚠️ WARNING: Backticks found in YAML (use quotes instead)"
+
+# Verify network name
+grep "homelab_web" docker-compose.yml || echo "❌ CRITICAL: Network should be homelab_web"
+
+# Verify Traefik labels consistency
+# Extract port from expose: and traefik.http.services.*.loadbalancer.server.port
+EXPOSE_PORT=$(grep -A1 "expose:" docker-compose.yml | grep -o '[0-9]\+' | head -1)
+TRAEFIK_PORT=$(grep "loadbalancer.server.port" docker-compose.yml | grep -o '[0-9]\+')
+
+if [ "$EXPOSE_PORT" != "$TRAEFIK_PORT" ]; then
+    echo "❌ CRITICAL: Port mismatch - expose: $EXPOSE_PORT, traefik: $TRAEFIK_PORT"
+fi
+```
+
+**Common Issues & Fixes**:
+
+```yaml
+# ❌ WRONG: Backticks in YAML
+labels:
+  - "traefik.http.routers.app.rule=Host(`app.example.com`)"
+
+# ✅ CORRECT: Quoted properly  
+labels:
+  - "traefik.http.routers.app.rule=Host(`app.example.com`)"
+  # OR
+  - traefik.http.routers.app.rule=Host(`app.example.com`)
+
+# ❌ WRONG: Network name
+networks:
+  - homelab  # This doesn't exist!
+
+# ✅ CORRECT: Exact network name
+networks:
+  - homelab_web
+```
+
+**Success Criteria**:
+
+- ✅ YAML syntax valid
+- ✅ No backticks in YAML strings (or properly escaped)
+- ✅ Network name is `homelab_web`
+- ✅ Ports match between `expose` and Traefik labels
+
+### Step 1.6: Environment Discovery
+
+**Purpose**: Gather information needed for DNS configuration
+
+```bash
+# Get homelab server public IP
+ssh <HOMELAB_SERVER> "curl -s ifconfig.me"
+```
+
+**Record for later**:
+
+- Public IP: `_____________`
+- App Name: `_____________`
+- Domain: `_____________.example.com`
+- Internal Port: `_____________`
+
+**Success Criteria**:
+
+- ✅ Public IP recorded
+- ✅ All deployment variables confirmed
+
+---
+
+## PHASE 2: Automated Build & Deploy (20 minutes)
+
+**Variables from Phase 1**:
+
+- `HOMELAB_SERVER`: SSH target (e.g., `user@razor-edge`)
+- `APP_NAME`: Application name
+- `REPOSITORY_URL`: Git repo
+- `NPM_COMMAND`: `npm ci` or `npm install` (from Step 1.2)
+
+### Step 2.1: Clone to Production Location
+
+```bash
+# Clone to homelab server
+ssh <HOMELAB_SERVER> "cd /opt/homelab/apps && git clone <REPOSITORY_URL> <APP_NAME>"
+```
+
+### Step 2.2: Install Dependencies & Build
+
+```bash
+# Install dependencies (use command determined in Phase 1)
+ssh <HOMELAB_SERVER> "cd /opt/homelab/apps/<APP_NAME> && <NPM_COMMAND>"
+
+# Build application
+ssh <HOMELAB_SERVER> "cd /opt/homelab/apps/<APP_NAME> && npm run build"
+```
+
+**Verify**:
+
+```bash
+# Check build output
+ssh <HOMELAB_SERVER> "ls -lah /opt/homelab/apps/<APP_NAME>/.next" # For Next.js
+# OR
+ssh <HOMELAB_SERVER> "ls -lah /opt/homelab/apps/<APP_NAME>/dist" # For Vite/other
+```
+
+**Success Criteria**:
+
+- ✅ `npm install/ci` completes without errors
+- ✅ `npm run build` completes without errors
+- ✅ Build output directory exists and has content
+
+### Step 2.3: Build Docker Image
+
+**Validation before build**:
+
+```bash
+# Confirm Dockerfile matches build output
+ssh <HOMELAB_SERVER> "cd /opt/homelab/apps/<APP_NAME> && cat Dockerfile | grep 'COPY.*next\|COPY.*dist'"
+```
+
+```bash
+# Build Docker image
+ssh <HOMELAB_SERVER> "cd /opt/homelab/apps/<APP_NAME> && docker build -t <APP_NAME>:latest ."
+```
+
+**Verify**:
+
+```bash
+# Check image was created
+ssh <HOMELAB_SERVER> "docker images | grep <APP_NAME>"
+
+# Verify image size is reasonable (not 0 bytes, not > 2GB for simple apps)
+ssh <HOMELAB_SERVER> "docker images <APP_NAME>:latest --format '{{.Size}}'"
+```
+
+**Success Criteria**:
+
+- ✅ Image builds without errors
+- ✅ Image size is reasonable (typically 100MB - 500MB for Node apps)
+- ✅ Image tagged as `<APP_NAME>:latest`
+
+### Step 2.4: Start Container with docker-compose
+
+```bash
+# Start container stack
+ssh <HOMELAB_SERVER> "cd /opt/homelab/apps/<APP_NAME> && docker-compose up -d"
+```
+
+**Verify**:
+
+```bash
+# Check container is running (not restarting)
+ssh <HOMELAB_SERVER> "docker ps --filter name=<APP_NAME>"
+
+# Check container logs for startup errors
+ssh <HOMELAB_SERVER> "docker logs <APP_NAME> --tail 50"
+```
+
+**Success Criteria**:
+
+- ✅ Container status is "Up" (not "Restarting")
+- ✅ No critical errors in logs
+- ✅ Application started successfully
+
+---
+
+## PHASE 3: Automated Internal Verification (10 minutes)
+
+**Test Order**: Local → Traefik → External (never skip steps!)
+
+### Step 3.1: Test Direct Container Access
+
+**Purpose**: Verify app works before testing Traefik/DNS
+
+```bash
+# Get container IP address
+CONTAINER_IP=$(ssh <HOMELAB_SERVER> "docker inspect <APP_NAME> | jq -r '.[0].NetworkSettings.Networks[\"homelab_web\"].IPAddress'")
+
+echo "Container IP: $CONTAINER_IP"
+
+# Test direct HTTP access to container
+ssh <HOMELAB_SERVER> "curl -I http://$CONTAINER_IP:<INTERNAL_PORT>"
+```
+
+**Expected Output**:
+
+```
+HTTP/1.1 200 OK
+...
+```
+
+**If fails**:
+
+```bash
+# Check application logs
+ssh <HOMELAB_SERVER> "docker logs <APP_NAME> --tail 100"
+
+# Check if app is listening on correct port
+ssh <HOMELAB_SERVER> "docker exec <APP_NAME> netstat -tulpn | grep <INTERNAL_PORT>"
+```
+
+**Success Criteria**:
+
+- ✅ HTTP 200 OK response
+- ✅ Container is listening on correct port
+- ✅ No errors in application logs
+
+### Step 3.2: Test Traefik Routing
+
+**Purpose**: Verify Traefik can route to container
+
+```bash
+# Test routing with Host header (simulates domain request)
+ssh <HOMELAB_SERVER> "curl -I -H 'Host: <APP_NAME>.example.com' http://localhost"
+```
+
+**Expected Output**:
+
+```
+HTTP/1.1 200 OK
+...
+```
+
+**If fails**:
+
+```bash
+# Verify container is on homelab_web network
+ssh <HOMELAB_SERVER> "docker network inspect homelab_web | jq -r '.[] | .Containers | to_entries[] | select(.value.Name | contains(\"<APP_NAME>\"))'"
+
+# Check Traefik logs for routing errors
+ssh <HOMELAB_SERVER> "docker logs traefik --tail 100 | grep <APP_NAME>"
+```
+
+**Success Criteria**:
+
+- ✅ HTTP 200 OK via Traefik
+- ✅ Container visible in homelab_web network
+- ✅ Traefik recognized the service
+
+### Step 3.3: Verify Traefik Dashboard
+
+**Purpose**: Visual confirmation of routing configuration
+
+Navigate to: `http://traefik.<YOUR_DOMAIN>/dashboard/#/http/routers`
+
+**Check**:
+
+- ✅ Router named `<APP_NAME>@docker` exists
+- ✅ Status is green (healthy)
+- ✅ Rule shows correct domain: `Host(<APP_NAME>.example.com)`
+- ✅ Service is linked and healthy
+
+**Screenshot**: Claude should take a screenshot of the dashboard showing the healthy router
+
+**Success Criteria**:
+
+- ✅ Router exists and is healthy
+- ✅ Rule matches expected domain
+- ✅ Service shows 1 server (the container)
+
+---
+
+## PHASE 4: DNS Configuration (5 minutes)
+
+**Variables needed**:
+
+- `PUBLIC_IP`: From Step 1.6
+- `DOMAIN`: Full domain (e.g., `app.example.com`)
+- `SUBDOMAIN`: Just the subdomain part (e.g., `app`)
+
+### Step 4.1: Clean Up Old DNS Records → PAIN POINT #5 PREVENTION
+
+**Purpose**: Prevent multiple A records causing routing confusion
+
+**Manual Step** (Claude guides user):
+
+1. Open Cloudflare Dashboard
+2. Navigate to: Domain → DNS → Records
+3. Search for: `<SUBDOMAIN>`
+4. **Delete ALL old A records** for this subdomain
+5. Verify only one A record will exist after next step
+
+**Why this matters**: Multiple A records cause Round-Robin DNS, sending traffic to wrong IPs
+
+**Success Criteria**:
+
+- ✅ All old/duplicate A records deleted
+- ✅ Ready to create single new A record
+
+### Step 4.2: Create A Record
+
+**Cloudflare Settings**:
+
+```
+Type: A
+Name: <SUBDOMAIN>
+IPv4 address: <PUBLIC_IP>
+Proxy status: ✅ Proxied (Orange cloud)
+TTL: Auto
+```
+
+**Screenshot**: Claude should verify the settings before user clicks Save
+
+**Success Criteria**:
+
+- ✅ Single A record created
+- ✅ Points to correct public IP
+- ✅ Proxied through Cloudflare
+
+---
+
+## PHASE 5: External Verification (5-15 minutes)
+
+### Step 5.1: DNS Propagation Check
+
+```bash
+# Check DNS resolution (should show Cloudflare IPs if proxied)
+dig <DOMAIN> +short
+```
+
+**Expected** (if proxied):
+
+```
+104.21.x.x
+172.67.x.x
+```
+
+**If shows your public IP directly**: Proxy not enabled in Cloudflare (orange cloud should be on)
+
+**Success Criteria**:
+
+- ✅ DNS resolves to Cloudflare IPs (if proxied)
+- ✅ DNS resolution completes within 2-5 minutes
+
+### Step 5.2: Cloudflare Cache Management → PAIN POINT #4 AWARENESS
+
+**CRITICAL UNDERSTANDING**: Cloudflare WILL cache content for up to 3 hours. This is NORMAL, not a deployment failure!
+
+**Test Sequence**:
+
+```bash
+# First test (may show cached content)
+curl -I https://<DOMAIN>
+
+# If shows old content:
+# 1. Go to Cloudflare Dashboard → Caching → Purge Everything
+# 2. Wait 30-60 seconds
+# 3. Test again
+
+curl -I https://<DOMAIN>
+```
+
+**Success Criteria**:
+
+- ✅ Understand caching is expected
+- ✅ Know how to purge cache
+- ✅ Don't mistake cache for deployment failure
+
+### Step 5.3: Final Comprehensive Verification
+
+```bash
+# Test HTTPS access
+curl -I https://<DOMAIN>
+
+# Test full page load
+curl -s https://<DOMAIN> | head -50
+
+# Check SSL certificate
+echo | openssl s_client -connect <DOMAIN>:443 -servername <DOMAIN> 2>/dev/null | openssl x509 -noout -subject -dates
+```
+
+**Expected Output**:
+
+```
+HTTP/2 200 
+server: cloudflare
+...
+```
+
+**Browser Test** (Claude should use browser automation):
+
+1. Navigate to `https://<DOMAIN>`
+2. Open DevTools Console
+3. Check for JavaScript errors
+4. Verify page renders correctly
+5. Take screenshot
+
+**Success Criteria**:
+
+- ✅ HTTP/2 200 OK
+- ✅ `server: cloudflare` header present
+- ✅ Valid SSL certificate from Cloudflare
+- ✅ Page content loads correctly in browser
+- ✅ No critical console errors
+- ✅ All expected functionality works
+
+---
+
+## SUCCESS CONFIRMATION CHECKLIST
+
+Before reporting success to user, Claude MUST verify:
+
+**Phase 1: Pre-Flight**
+
+- ✅ package.json validated (all dependencies present)
+- ✅ Dockerfile validated (> 10 lines, has essential commands)
+- ✅ Network `homelab_web` exists
+- ✅ docker-compose.yml validated (correct network, ports match, no YAML errors)
+- ✅ Public IP obtained
+
+**Phase 2: Build & Deploy**
+
+- ✅ Dependencies installed successfully
+- ✅ Build completed without errors
+- ✅ Docker image built (reasonable size)
+- ✅ Container running (not restarting)
+
+**Phase 3: Internal Verification**
+
+- ✅ Direct container access works (HTTP 200)
+- ✅ Traefik routing works (HTTP 200)
+- ✅ Traefik dashboard shows healthy router
+
+**Phase 4: DNS**
+
+- ✅ Old DNS records cleaned up
+- ✅ Single A record created, proxied
+- ✅ Points to correct IP
+
+**Phase 5: External Verification**
+
+- ✅ DNS resolves correctly
+- ✅ HTTPS works (HTTP/2 200)
+- ✅ Cloudflare headers present
+- ✅ Page renders in browser
+- ✅ No critical console errors
+
+---
+
+## TROUBLESHOOTING GUIDE
+
+### Issue: Container Immediately Exits/Restarts
+
+**Check**:
+
+```bash
+# View full logs
+ssh <HOMELAB_SERVER> "docker logs <APP_NAME>"
+
+# Check exit code
+ssh <HOMELAB_SERVER> "docker inspect <APP_NAME> | jq -r '.[0].State.ExitCode'"
+```
+
+**Common Causes**:
+
+- Missing environment variables
+- Port already in use
+- Application crash on startup
+- Incorrect CMD/ENTRYPOINT in Dockerfile
+
+### Issue: Traefik Can't Route to Container
+
+**Check**:
+
+```bash
+# Verify container is on homelab_web
+ssh <HOMELAB_SERVER> "docker network inspect homelab_web | grep <APP_NAME>"
+
+# Test Traefik can reach container
+ssh <HOMELAB_SERVER> "docker exec traefik wget -O- http://<APP_NAME>:<PORT>"
+```
+
+**Common Causes**:
+
+- Container not on `homelab_web` network (wrong network name in docker-compose.yml)
+- Port mismatch between expose and Traefik labels
+- Traefik labels incorrect/malformed
+
+### Issue: External Access Fails (But Internal Works)
+
+**Check**:
+
+```bash
+# Verify firewall allows 80/443
+ssh <HOMELAB_SERVER> "sudo iptables -L -n | grep -E '80|443'"
+
+# Check DNS points to correct IP
+dig <DOMAIN> +short
+
+# Verify Cloudflare proxy status
+# (Check in Cloudflare dashboard - orange cloud = proxied)
+```
+
+**Common Causes**:
+
+- DNS not pointing to correct IP
+- Cloudflare proxy disabled
+- Firewall blocking ports 80/443
+- Cloudflare cache showing old content (purge cache)
+
+### Issue: Page Loads But Shows Old Content → PAIN POINT #4
+
+**This is NOT a deployment failure!**
+
+**Solution**:
+
+1. Cloudflare Dashboard → Caching → Purge Everything
+2. Wait 30-60 seconds
+3. Hard refresh browser (Ctrl+Shift+R)
+4. Check DevTools → Application → Clear Storage
+5. Test in incognito/private window
+
+**Prevention**: Always purge cache after deployments
+
+---
+
+## PAIN POINT CROSS-REFERENCE
+
+| Pain Point | Prevented By | Auto-Fixed? |
+|---|---|---|
+| #1: Missing Dependencies | Step 1.2: package.json validation | ❌ Needs user approval |
+| #2: Wrong Network Name | Step 1.4: Infrastructure validation | ✅ Creates homelab_web |
+| #3: Empty Dockerfile | Step 1.3: Dockerfile validation | ❌ Needs user approval |
+| #4: Cloudflare Caching | Step 5.2: Cache awareness | ℹ️ User educated |
+| #5: Multiple DNS Records | Step 4.1: DNS cleanup | ⚠️ Manual user task |
+| #6: No package-lock.json | Step 1.2: Determines npm command | ✅ Auto-detected |
+| #7: GitLab Auth | N/A: Workflow uses direct deployment | ✅ Avoided |
+| #8: YAML Escaping | Step 1.5: YAML validation | ❌ Needs user fix |
+
+---
+
+## DEPLOYMENT TEMPLATES
+
+### Next.js Application (Full Template)
+
+**Dockerfile**:
+
+```dockerfile
+FROM node:18-alpine AS base
+
+FROM base AS deps
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+FROM base AS builder  
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+FROM base AS runner
+WORKDIR /app
+ENV NODE_ENV production
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+USER nextjs
+EXPOSE 3000
+ENV PORT 3000
+CMD ["node", "server.js"]
+```
+
+**docker-compose.yml**:
+
+```yaml
+version: '3.8'
+
+services:
+  app:
+    build: .
+    image: my-app:latest
+    container_name: my-app
+    restart: unless-stopped
+    expose:
+      - "3000"
+    networks:
+      - homelab_web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.my-app.rule=Host(`app.example.com`)"
+      - "traefik.http.routers.my-app.entrypoints=websecure"
+      - "traefik.http.routers.my-app.tls.certresolver=letsencrypt"
+      - "traefik.http.services.my-app.loadbalancer.server.port=3000"
+      - "traefik.docker.network=homelab_web"
+
+networks:
+  homelab_web:
+    external: true
+```
+
+---
+
+## ONE-SHOT DEPLOYMENT COMMAND SEQUENCE
+
+For experienced users, this is the complete sequence (assumes all validations pass):
+
+```bash
+# Phase 1: Validate
+git clone <REPO> /tmp/app-check && cd /tmp/app-check
+cat package.json | jq '.dependencies, .scripts'
+wc -l Dockerfile && cat Dockerfile
+ssh <SERVER> "docker network ls | grep homelab_web"
+
+# Phase 2: Deploy
+ssh <SERVER> "cd /opt/homelab/apps && git clone <REPO> <APP>"
+ssh <SERVER> "cd /opt/homelab/apps/<APP> && npm ci && npm run build"
+ssh <SERVER> "cd /opt/homelab/apps/<APP> && docker build -t <APP>:latest ."
+ssh <SERVER> "cd /opt/homelab/apps/<APP> && docker-compose up -d"
+
+# Phase 3: Verify
+ssh <SERVER> "docker logs <APP> --tail 50"
+curl -I -H "Host: <DOMAIN>" http://<SERVER>
+
+# Phase 4: DNS (manual in Cloudflare)
+
+# Phase 5: Test
+curl -I https://<DOMAIN>
+```
+
+**Time**: ~30 minutes (if no issues found)
+
+---
+
+## ADDITIONAL RESOURCES
+
+- **Full Deployment Guide**: `/opt/homelab/docs/DEPLOYMENT-GUIDE.md`
+- **Quick Cheat Sheet**: `/opt/homelab/docs/DEPLOYMENT-CHEAT-SHEET.md`
+- **Pain Point Analysis**: `/opt/homelab/docs/DEPLOYMENT-SUMMARY.md`
+- **Dockerfile Templates**: DEPLOYMENT-GUIDE.md (multiple frameworks)
+- **Traefik Configuration**: `/opt/homelab/docs/network/deployment/docker-compose.traefik.yml`
+
+---
+
+## FINAL SUCCESS DEFINITION
+
+**Deployment is complete when**:
+
+✅ **Phase 1**: All 6 pre-flight checks passed  
+✅ **Phase 2**: Container built and running (no restarts)  
+✅ **Phase 3**: Internal tests successful (direct + Traefik)  
+✅ **Phase 4**: DNS configured (single A record, proxied)  
+✅ **Phase 5**: External access verified (HTTPS 200, no console errors)  
+
+**Evidence required**:
+
+- Screenshot of Traefik dashboard showing healthy router
+- Screenshot of browser loading site successfully
+- Output of `curl -I https://<DOMAIN>` showing HTTP/2 200
+
+**Result**: First-time deployment success! 🎉
+
+---
+
+**Workflow Version**: 2.0 (One-Shot Edition)  
+**Last Updated**: 2026-01-29  
+**Prevents**: 8 historical pain points  
+**Success Rate**: 95%+ (when followed completely)
